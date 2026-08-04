@@ -4,3 +4,12 @@ src/generated/
 dist/
 *.log
 .DS_Store
+
+cat >> backend/.gitignore << 'EOF'
+.agents/
+.claude/
+.windsurf/
+skills-lock.json
+tsconfig.json
+src/routes/flowCharts/
+EOF
