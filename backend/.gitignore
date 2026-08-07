@@ -11,5 +11,5 @@ cat >> backend/.gitignore << 'EOF'
 .windsurf/
 skills-lock.json
 tsconfig.json
-src/routes/flowCharts/
+src/flowCharts/
 EOF
