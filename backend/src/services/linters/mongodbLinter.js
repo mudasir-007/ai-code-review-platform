@@ -63,14 +63,9 @@ const RULES = [
     message:
       'Unanchored $regex can cause a full collection scan. Prefix with ^ to use an index, or prefer $text search.',
   },
-  {
-    // Mongoose hydrates full Documents by default — .lean() returns plain objects
-    pattern: /\.find(?:One)?\([^)]*\)\s*(?!\.lean\b)/,
-    ruleId: 'mongodb/prefer-lean',
-    severity: 'info',
-    message:
-      'Consider .lean() on Mongoose read-only queries to return plain JS objects and reduce memory overhead.',
-  },
+  // NOTE: prefer-lean is intentionally omitted from RULES because it requires
+  // multi-line lookahead that a single-line regex cannot perform correctly.
+  // It is implemented separately in the run() function below.
   {
     // .drop() is irreversible — should not be reachable from application code
     pattern: /\.\s*drop\s*\(\s*\)/,
@@ -146,6 +141,38 @@ export async function run(repoRoot) {
     }
 
     if (issues.length > 0) {
+      results.push({ filePath: relFilePath, issues });
+    }
+
+    // ── prefer-lean: multi-line lookahead ────────────────────────────────────
+    // Matches only Capitalized.find() / Capitalized.findOne() (Mongoose model
+    // convention) to avoid false-positives on Array.prototype.find().
+    // Then checks whether .lean() appears within the next 5 lines.
+    const LEAN_MODEL_RE = /\b([A-Z][A-Za-z0-9]*)\.(find(?:One)?)\s*\(/g;
+    for (let i = 0; i < lines.length; i++) {
+      const lineText = lines[i];
+      const trimmed = lineText.trimStart();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('#')) continue;
+
+      LEAN_MODEL_RE.lastIndex = 0;
+      if (!LEAN_MODEL_RE.test(lineText)) continue;
+
+      // Look ahead up to 5 lines for a .lean() call
+      const lookaheadEnd = Math.min(i + 5, lines.length);
+      const block = lines.slice(i, lookaheadEnd).join('\n');
+      if (/\.lean\s*\(/.test(block)) continue;
+
+      issues.push({
+        line: i + 1,
+        column: lineText.indexOf('.find') + 1,
+        severity: 'info',
+        message: 'Consider .lean() on Mongoose read-only queries to return plain JS objects and reduce memory overhead.',
+        ruleId: 'mongodb/prefer-lean',
+        source: 'mongodb-analyzer',
+      });
+    }
+
+    if (issues.length > 0 && !results.some((r) => r.filePath === relFilePath)) {
       results.push({ filePath: relFilePath, issues });
     }
   }
