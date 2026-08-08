@@ -1,19 +1,61 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+/**
+ * linterService.js
+ *
+ * Orchestrates all language linters: detects languages, runs applicable linters
+ * in isolated try/catch blocks, and merges results into a unified output shape.
+ *
+ * Supported languages (14):
+ *  JavaScript/TypeScript  → ESLint 10
+ *  Python                 → Flake8
+ *  Rust                   → Cargo Clippy
+ *  Go                     → golangci-lint
+ *  Java                   → Checkstyle (Google checks)
+ *  Ruby                   → RuboCop
+ *  PHP                    → PHP_CodeSniffer (PSR-12)
+ *  C / C++                → Cppcheck
+ *  Swift                  → SwiftLint
+ *  Kotlin                 → ktlint
+ *  Shell / Bash           → ShellCheck
+ *  SQL / PostgreSQL        → SQLFluff (dialect auto-detected)
+ *  MongoDB                → Built-in static analyzer (no binary needed)
+ */
+
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { ESLint } from 'eslint';
-import js from '@eslint/js';
 import { findManifestDirectories, walkRepo } from '../utils/repoWalker.js';
 
-const execFileAsync = promisify(execFile);
+// ─── Linter modules ───────────────────────────────────────────────────────────
 
-const JS_EXTENSIONS = ['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx'];
-const PYTHON_EXTENSIONS = ['.py'];
-const RUST_EXTENSIONS = ['.rs'];
+import * as eslintLinter    from './linters/eslintLinter.js';
+import * as flake8Linter    from './linters/flake8Linter.js';
+import * as clippyLinter    from './linters/clippyLinter.js';
+import * as golangLinter    from './linters/golangLinter.js';
+import * as javaLinter      from './linters/javaLinter.js';
+import * as rubyLinter      from './linters/rubyLinter.js';
+import * as phpLinter       from './linters/phpLinter.js';
+import * as cppLinter       from './linters/cppLinter.js';
+import * as swiftLinter     from './linters/swiftLinter.js';
+import * as kotlinLinter    from './linters/kotlinLinter.js';
+import * as shellLinter     from './linters/shellLinter.js';
+import * as sqlLinter       from './linters/sqlLinter.js';
+import * as mongodbLinter   from './linters/mongodbLinter.js';
 
-const JS_GLOBS = ['**/*.{js,mjs,cjs,jsx,ts,tsx}'];
-const LINTER_TIMEOUT_MS = 120_000;
+// ─── Extension constants (exported for consumers) ─────────────────────────────
+
+export const JS_EXTENSIONS      = eslintLinter.EXTENSIONS;
+export const PYTHON_EXTENSIONS  = flake8Linter.EXTENSIONS;
+export const RUST_EXTENSIONS    = clippyLinter.EXTENSIONS;
+export const GO_EXTENSIONS      = golangLinter.EXTENSIONS;
+export const JAVA_EXTENSIONS    = javaLinter.EXTENSIONS;
+export const RUBY_EXTENSIONS    = rubyLinter.EXTENSIONS;
+export const PHP_EXTENSIONS     = phpLinter.EXTENSIONS;
+export const CPP_EXTENSIONS     = cppLinter.EXTENSIONS;
+export const SWIFT_EXTENSIONS   = swiftLinter.EXTENSIONS;
+export const KOTLIN_EXTENSIONS  = kotlinLinter.EXTENSIONS;
+export const SHELL_EXTENSIONS   = shellLinter.EXTENSIONS;
+export const SQL_EXTENSIONS     = sqlLinter.EXTENSIONS;
+
+// ─── Typedefs ─────────────────────────────────────────────────────────────────
 
 /**
  * @typedef {'error' | 'warning' | 'info'} IssueSeverity
@@ -26,21 +68,22 @@ const LINTER_TIMEOUT_MS = 120_000;
  * @property {IssueSeverity} severity
  * @property {string} message
  * @property {string} ruleId
- * @property {'eslint' | 'flake8' | 'clippy'} source
+ * @property {string} source  - e.g. 'eslint', 'flake8', 'clippy', 'rubocop', ...
  */
 
 /**
  * @typedef {Object} LintFileResult
- * @property {string} filePath
+ * @property {string} filePath  - Repo-relative path
  * @property {LintIssue[]} issues
  */
 
 /**
  * @typedef {Object} LinterRunResult
- * @property {'eslint' | 'flake8' | 'clippy'} linter
+ * @property {string} linter   - Linter identifier (e.g. 'eslint', 'rubocop')
  * @property {'success' | 'failed' | 'skipped'} status
  * @property {LintFileResult[]} results
  * @property {string | null} error
+ * @property {'binary_not_found' | 'runtime_error' | 'parse_error' | null} reason
  */
 
 /**
@@ -50,25 +93,44 @@ const LINTER_TIMEOUT_MS = 120_000;
  * @property {{ languages: string[], fileCounts: Record<string, number> }} detection
  */
 
-function normalizeSeverity(value) {
-  if (value === 2 || value === '2' || value === 'error') return 'error';
-  if (value === 1 || value === '1' || value === 'warning') return 'warning';
-  return 'info';
-}
+// ─── Linter registry ──────────────────────────────────────────────────────────
+
+/**
+ * Central registry mapping language → linter config.
+ * Add new linters here; no changes needed in runLinters().
+ *
+ * @type {Array<{
+ *   language: string,
+ *   linterId: string,
+ *   module: { run: (root: string) => Promise<LintFileResult[]>, EXTENSIONS: string[], MANIFESTS: string[] },
+ *   flag: string,
+ * }>}
+ */
+const LINTER_REGISTRY = [
+  { language: 'javascript', linterId: 'eslint',            module: eslintLinter,   flag: 'runJavaScript' },
+  { language: 'python',     linterId: 'flake8',            module: flake8Linter,   flag: 'runPython'     },
+  { language: 'rust',       linterId: 'clippy',            module: clippyLinter,   flag: 'runRust'       },
+  { language: 'go',         linterId: 'golangci-lint',     module: golangLinter,   flag: 'runGo'         },
+  { language: 'java',       linterId: 'checkstyle',        module: javaLinter,     flag: 'runJava'       },
+  { language: 'ruby',       linterId: 'rubocop',           module: rubyLinter,     flag: 'runRuby'       },
+  { language: 'php',        linterId: 'phpcs',             module: phpLinter,      flag: 'runPhp'        },
+  { language: 'cpp',        linterId: 'cppcheck',          module: cppLinter,      flag: 'runCpp'        },
+  { language: 'swift',      linterId: 'swiftlint',         module: swiftLinter,    flag: 'runSwift'      },
+  { language: 'kotlin',     linterId: 'ktlint',            module: kotlinLinter,   flag: 'runKotlin'     },
+  { language: 'shell',      linterId: 'shellcheck',        module: shellLinter,    flag: 'runShell'      },
+  { language: 'sql',        linterId: 'sqlfluff',          module: sqlLinter,      flag: 'runSql'        },
+  { language: 'mongodb',    linterId: 'mongodb-analyzer',  module: mongodbLinter,  flag: 'runMongodb'    },
+];
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function mergeResultsByFile(results) {
   const merged = new Map();
-
   for (const fileResult of results) {
-    const existing = merged.get(fileResult.filePath) ?? {
-      filePath: fileResult.filePath,
-      issues: [],
-    };
-
+    const existing = merged.get(fileResult.filePath) ?? { filePath: fileResult.filePath, issues: [] };
     existing.issues.push(...fileResult.issues);
     merged.set(fileResult.filePath, existing);
   }
-
   return [...merged.values()];
 }
 
@@ -84,38 +146,75 @@ async function pathExists(targetPath) {
 async function countFilesByExtension(repoRoot, extensions) {
   const files = await walkRepo(repoRoot, { extensions });
   const counts = Object.fromEntries(extensions.map((ext) => [ext, 0]));
-
   for (const file of files) {
     const ext = path.extname(file).toLowerCase();
     if (counts[ext] !== undefined) counts[ext] += 1;
   }
-
   return { files, counts };
 }
 
+// ─── Language detection ───────────────────────────────────────────────────────
+
 /**
- * Detects likely languages present in a repository.
+ * Detects which programming languages are present in a repository by
+ * scanning file extensions and well-known manifest files.
+ *
+ * @param {string} repoRoot
+ * @returns {Promise<{ languages: string[], fileCounts: Record<string, number> }>}
  */
 export async function detectLanguages(repoRoot) {
   const languages = new Set();
   const fileCounts = {};
 
-  const [{ files: jsFiles, counts: jsCounts }, pythonWalk, rustWalk] = await Promise.all([
-    countFilesByExtension(repoRoot, JS_EXTENSIONS),
-    countFilesByExtension(repoRoot, PYTHON_EXTENSIONS),
-    countFilesByExtension(repoRoot, RUST_EXTENSIONS),
+  // Walk all extension groups in parallel
+  const allExtensions = LINTER_REGISTRY.flatMap((e) => e.module.EXTENSIONS);
+  const uniqueExtensions = [...new Set(allExtensions)];
+
+  const [{ files: allFiles, counts }] = await Promise.all([
+    countFilesByExtension(repoRoot, uniqueExtensions),
   ]);
+  Object.assign(fileCounts, counts);
 
-  Object.assign(fileCounts, jsCounts, pythonWalk.counts, rustWalk.counts);
+  // Collect files per language by extension
+  const filesByExt = new Map();
+  for (const file of allFiles) {
+    const ext = path.extname(file).toLowerCase();
+    if (!filesByExt.has(ext)) filesByExt.set(ext, []);
+    filesByExt.get(ext).push(file);
+  }
 
-  const hasPackageJson = await pathExists(path.join(repoRoot, 'package.json'));
-  const hasPyProject = await pathExists(path.join(repoRoot, 'pyproject.toml'));
-  const hasRequirements = await pathExists(path.join(repoRoot, 'requirements.txt'));
-  const hasCargoToml = (await findManifestDirectories(repoRoot, 'Cargo.toml')).length > 0;
+  // Check manifest files for each linter in parallel
+  const manifestChecks = await Promise.all(
+    LINTER_REGISTRY.map(async ({ language, module }) => {
+      const exts = module.EXTENSIONS;
+      const hasFiles = exts.some((ext) => (filesByExt.get(ext)?.length ?? 0) > 0);
 
-  if (jsFiles.length > 0 || hasPackageJson) languages.add('javascript');
-  if (pythonWalk.files.length > 0 || hasPyProject || hasRequirements) languages.add('python');
-  if (rustWalk.files.length > 0 || hasCargoToml) languages.add('rust');
+      let hasManifest = false;
+      for (const manifest of (module.MANIFESTS ?? [])) {
+        if (await pathExists(path.join(repoRoot, manifest))) {
+          hasManifest = true;
+          break;
+        }
+        // Also check subdirectories for multi-module projects (e.g. Cargo.toml, pom.xml)
+        if ((await findManifestDirectories(repoRoot, manifest)).length > 0) {
+          hasManifest = true;
+          break;
+        }
+      }
+
+      return { language, detected: hasFiles || hasManifest };
+    }),
+  );
+
+  for (const { language, detected } of manifestChecks) {
+    if (detected) languages.add(language);
+  }
+
+  // MongoDB detection: JS/TS files that import mongoose or mongodb
+  // (already handled inside mongodbLinter.run — mark language present if JS detected)
+  if (languages.has('javascript')) {
+    languages.add('mongodb');
+  }
 
   return {
     languages: [...languages],
@@ -123,225 +222,85 @@ export async function detectLanguages(repoRoot) {
   };
 }
 
-async function buildEslintInstance(repoRoot) {
-  const config = [
-    {
-      ignores: [
-        '**/node_modules/**',
-        '**/dist/**',
-        '**/build/**',
-        '**/.git/**',
-        '**/coverage/**',
-        '**/target/**',
-      ],
-    },
-    js.configs.recommended,
-    {
-      files: ['**/*.{js,mjs,cjs,jsx}'],
-      languageOptions: {
-        ecmaVersion: 'latest',
-        sourceType: 'module',
-      },
-    },
-  ];
+// ─── Fault isolation ──────────────────────────────────────────────────────────
 
-  try {
-    const tseslint = await import('typescript-eslint');
-    config.push(...tseslint.configs.recommended);
-  } catch {
-    // TypeScript linting falls back to JS-only when typescript-eslint is unavailable.
-  }
-
-  return new ESLint({
-    cwd: repoRoot,
-    overrideConfig: config,
-    errorOnUnmatchedPattern: false,
-  });
-}
-
-function normalizeEslintResults(eslintResults) {
-  return eslintResults
-    .filter((result) => result.messages.length > 0)
-    .map((result) => ({
-      filePath: result.filePath,
-      issues: result.messages.map((message) => ({
-        line: message.line ?? 1,
-        column: message.column ?? 1,
-        severity: normalizeSeverity(message.severity),
-        message: message.message,
-        ruleId: message.ruleId ?? 'eslint/unknown',
-        source: 'eslint',
-      })),
-    }));
-}
-
-async function runEslint(repoRoot) {
-  const eslint = await buildEslintInstance(repoRoot);
-  const eslintResults = await eslint.lintFiles(JS_GLOBS);
-  return normalizeEslintResults(eslintResults);
-}
-
-const FLAKE8_LINE_REGEX = /^(.+?):(\d+):(\d+):\s+([A-Z]\d+)\s+(.+)$/;
-
-function normalizeFlake8Output(stdout, repoRoot) {
-  const results = new Map();
-
-  for (const rawLine of stdout.split('\n')) {
-    const line = rawLine.trim();
-    if (!line) continue;
-
-    const match = line.match(FLAKE8_LINE_REGEX);
-    if (!match) continue;
-
-    const [, filePath, lineNumber, column, ruleId, message] = match;
-    const normalizedPath = path.isAbsolute(filePath)
-      ? path.relative(repoRoot, filePath)
-      : filePath.replace(/^\.\//, '');
-
-    const existing = results.get(normalizedPath) ?? {
-      filePath: normalizedPath,
-      issues: [],
-    };
-
-    existing.issues.push({
-      line: Number.parseInt(lineNumber, 10),
-      column: Number.parseInt(column, 10),
-      severity: 'warning',
-      message,
-      ruleId,
-      source: 'flake8',
-    });
-
-    results.set(normalizedPath, existing);
-  }
-
-  return [...results.values()];
-}
-
-async function runFlake8(repoRoot) {
-  const { files } = await countFilesByExtension(repoRoot, PYTHON_EXTENSIONS);
-  if (files.length === 0) return [];
-
-  const absoluteFiles = files.map((file) => path.join(repoRoot, file));
-  const { stdout } = await execFileAsync(
-    'flake8',
-    [...absoluteFiles, '--format=default'],
-    {
-      cwd: repoRoot,
-      timeout: LINTER_TIMEOUT_MS,
-      maxBuffer: 10 * 1024 * 1024,
-    },
-  );
-
-  return normalizeFlake8Output(stdout, repoRoot);
-}
-
-function normalizeClippyMessages(messages, repoRoot) {
-  const results = new Map();
-
-  for (const entry of messages) {
-    if (entry.reason !== 'compiler-message') continue;
-
-    const payload = entry.message;
-    if (!payload || !Array.isArray(payload.spans) || payload.spans.length === 0) continue;
-
-    const primarySpan = payload.spans.find((span) => span.is_primary) ?? payload.spans[0];
-    const absoluteFile = primarySpan.file_name;
-    const filePath = path.isAbsolute(absoluteFile)
-      ? path.relative(repoRoot, absoluteFile)
-      : absoluteFile;
-
-    const existing = results.get(filePath) ?? {
-      filePath,
-      issues: [],
-    };
-
-    existing.issues.push({
-      line: primarySpan.line_start ?? 1,
-      column: primarySpan.column_start ?? 1,
-      severity: normalizeSeverity(payload.level),
-      message: payload.message,
-      ruleId: payload.code?.code ?? 'clippy/unknown',
-      source: 'clippy',
-    });
-
-    results.set(filePath, existing);
-  }
-
-  return [...results.values()];
-}
-
-async function runClippyInProject(projectRoot, repoRoot) {
-  const { stdout } = await execFileAsync(
-    'cargo',
-    ['clippy', '--message-format=json', '--quiet'],
-    {
-      cwd: projectRoot,
-      timeout: LINTER_TIMEOUT_MS,
-      maxBuffer: 20 * 1024 * 1024,
-    },
-  );
-
-  const messages = stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-
-  return normalizeClippyMessages(messages, repoRoot);
-}
-
-async function runClippy(repoRoot) {
-  const cargoRoots = await findManifestDirectories(repoRoot, 'Cargo.toml');
-  if (cargoRoots.length === 0) return [];
-
-  const allResults = [];
-  for (const cargoRoot of cargoRoots) {
-    const projectResults = await runClippyInProject(cargoRoot, repoRoot);
-    allResults.push(...projectResults);
-  }
-
-  return mergeResultsByFile(allResults);
-}
-
-async function runIsolatedLinter(linter, runner) {
-  try {
-    const results = await runner();
-    return {
-      linter,
-      status: 'success',
-      results,
-      error: null,
-    };
-  } catch (error) {
-    return {
-      linter,
-      status: 'failed',
-      results: [],
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+function classifyLinterError(error) {
+  if (error?.code === 'ENOENT') return 'binary_not_found';
+  if (error?.name === 'SyntaxError' || error?.code === 'ERR_INVALID_ARG_TYPE') return 'parse_error';
+  return 'runtime_error';
 }
 
 /**
- * Runs all applicable linters with fault isolation and returns unified results.
+ * Runs a single linter in an isolated try/catch so one failure never
+ * aborts the rest of the pipeline.
+ *
+ * @param {string} linterId
+ * @param {() => Promise<LintFileResult[]>} runner
+ * @returns {Promise<LinterRunResult>}
  */
-export async function runLinters(
-  repoRoot,
-  {
+async function runIsolatedLinter(linterId, runner) {
+  try {
+    const results = await runner();
+    return { linter: linterId, status: 'success', results, error: null, reason: null };
+  } catch (error) {
+    const reason = classifyLinterError(error);
+    const errorMessage =
+      reason === 'binary_not_found'
+        ? `${linterId} binary not found. Install it on the server to enable ${linterId} linting.`
+        : (error instanceof Error ? error.message : String(error));
+
+    return { linter: linterId, status: 'failed', results: [], error: errorMessage, reason };
+  }
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Runs all applicable linters against a cloned repository and returns a
+ * unified, normalised set of lint findings.
+ *
+ * @param {string} repoRoot  - Absolute or relative path to the repo directory.
+ * @param {Object} [options]
+ * @param {string[] | null} [options.languages]  - Override detected language list.
+ * @param {boolean} [options.runJavaScript]
+ * @param {boolean} [options.runPython]
+ * @param {boolean} [options.runRust]
+ * @param {boolean} [options.runGo]
+ * @param {boolean} [options.runJava]
+ * @param {boolean} [options.runRuby]
+ * @param {boolean} [options.runPhp]
+ * @param {boolean} [options.runCpp]
+ * @param {boolean} [options.runSwift]
+ * @param {boolean} [options.runKotlin]
+ * @param {boolean} [options.runShell]
+ * @param {boolean} [options.runSql]
+ * @param {boolean} [options.runMongodb]
+ * @returns {Promise<RunLintersResponse>}
+ */
+export async function runLinters(repoRoot, options = {}) {
+  const {
     languages = null,
     runJavaScript = true,
-    runPython = true,
-    runRust = true,
-  } = {},
-) {
+    runPython     = true,
+    runRust       = true,
+    runGo         = true,
+    runJava       = true,
+    runRuby       = true,
+    runPhp        = true,
+    runCpp        = true,
+    runSwift      = true,
+    runKotlin     = true,
+    runShell      = true,
+    runSql        = true,
+    runMongodb    = true,
+  } = options;
+
+  const flags = {
+    runJavaScript, runPython, runRust, runGo, runJava,
+    runRuby, runPhp, runCpp, runSwift, runKotlin,
+    runShell, runSql, runMongodb,
+  };
+
   const absoluteRepoRoot = path.resolve(repoRoot);
   const repoStat = await fs.stat(absoluteRepoRoot).catch(() => null);
   if (!repoStat?.isDirectory()) {
@@ -351,19 +310,11 @@ export async function runLinters(
   const detection = await detectLanguages(absoluteRepoRoot);
   const selectedLanguages = languages ?? detection.languages;
 
-  const tasks = [];
-
-  if (runJavaScript && selectedLanguages.includes('javascript')) {
-    tasks.push(runIsolatedLinter('eslint', () => runEslint(absoluteRepoRoot)));
-  }
-
-  if (runPython && selectedLanguages.includes('python')) {
-    tasks.push(runIsolatedLinter('flake8', () => runFlake8(absoluteRepoRoot)));
-  }
-
-  if (runRust && selectedLanguages.includes('rust')) {
-    tasks.push(runIsolatedLinter('clippy', () => runClippy(absoluteRepoRoot)));
-  }
+  const tasks = LINTER_REGISTRY
+    .filter(({ language, flag }) => flags[flag] && selectedLanguages.includes(language))
+    .map(({ linterId, module }) =>
+      runIsolatedLinter(linterId, () => module.run(absoluteRepoRoot)),
+    );
 
   const runs = await Promise.all(tasks);
   const successfulResults = runs.flatMap((run) => run.results);
@@ -374,5 +325,3 @@ export async function runLinters(
     detection,
   };
 }
-
-export { JS_EXTENSIONS, PYTHON_EXTENSIONS, RUST_EXTENSIONS };
