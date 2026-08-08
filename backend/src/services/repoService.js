@@ -9,6 +9,10 @@ const GITHUB_API_BASE = 'https://api.github.com';
 const GITHUB_API_VERSION = '2022-11-28';
 const FETCH_TIMEOUT_MS = 30_000;
 
+/** Hard cap on repo size before attempting a download (in KB). GitHub reports size in KB. */
+const MAX_DOWNLOAD_SIZE_KB = 200 * 1024; // 200 MB
+const MAX_DOWNLOAD_SIZE_MB = MAX_DOWNLOAD_SIZE_KB / 1024;
+
 export class RepoFetchError extends Error {
   constructor(message, { code, statusCode, details } = {}) {
     super(message);
@@ -163,6 +167,16 @@ async function assertSourceRootNotEmpty(sourceRoot) {
 /**
  * Downloads a GitHub repository zipball and extracts it to a unique temp directory.
  *
+ * @param {object}  options
+ * @param {string}  options.owner          - GitHub repository owner
+ * @param {string}  options.repo           - GitHub repository name
+ * @param {string}  options.branch         - Branch/ref to download
+ * @param {string}  [options.githubToken]  - Optional GitHub PAT for private repos
+ * @param {number}  [options.maxRepoSizeKb] - If provided, blocks download when repo metadata
+ *                                           size exceeds this value (in KB). Pass the `size`
+ *                                           field from the GitHub repo metadata returned by
+ *                                           validateGitHubRepository().
+ *
  * @returns {Promise<{ sourceRoot: string, cleanup: () => Promise<void>, tempDir: string }>}
  */
 export async function fetchAndExtractRepo({
@@ -170,6 +184,7 @@ export async function fetchAndExtractRepo({
   repo,
   branch,
   githubToken = process.env.GITHUB_TOKEN,
+  maxRepoSizeKb = null,
 }) {
   if (!owner || !repo || !branch) {
     throw new RepoFetchError('owner, repo, and branch are required.', {
@@ -177,6 +192,22 @@ export async function fetchAndExtractRepo({
       statusCode: 400,
     });
   }
+
+  // --- Pre-download size enforcement -------------------------------------------
+  // GitHub's metadata `size` field is in KB. Block before touching the network
+  // if the repo is already known to exceed our hard cap.
+  if (typeof maxRepoSizeKb === 'number' && maxRepoSizeKb > MAX_DOWNLOAD_SIZE_KB) {
+    const repoMb = (maxRepoSizeKb / 1024).toFixed(0);
+    throw new RepoFetchError(
+      `Repository is too large to download (≈${repoMb} MB). Maximum allowed size is ${MAX_DOWNLOAD_SIZE_MB} MB.`,
+      {
+        code: 'REPO_TOO_LARGE',
+        statusCode: 422,
+        details: { sizeKb: maxRepoSizeKb, limitKb: MAX_DOWNLOAD_SIZE_KB },
+      },
+    );
+  }
+  // -----------------------------------------------------------------------------
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `review-${randomUUID()}-`));
 
