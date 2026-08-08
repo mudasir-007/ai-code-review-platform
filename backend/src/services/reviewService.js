@@ -2,17 +2,20 @@
  * reviewService.js
  *
  * Full pipeline orchestrator:
- *   1. Fetch & extract repo   (repoService)
- *   2. Scan for secrets       (secretScanner)
- *   3. Run all linters        (linterService)
- *   4. Build AI prompt
- *   5. Call AI with fallback  (aiProviderService)
- *   6. Parse & return ReviewReport
+ *   1. Validate repo via GitHub API  (validationService) — rate-limit, empty, archived, default-branch
+ *   2. Fetch & extract repo           (repoService)
+ *   3. Scan for secrets               (secretScanner)   — blocks pipeline if secrets found
+ *   4. Run all linters                (linterService)
+ *   5. Build AI prompt
+ *   6. Call AI with fallback          (aiProviderService)
+ *   7. Parse & return ReviewReport
  */
 
 import { fetchAndExtractRepo, RepoFetchError } from './repoService.js';
 import { runLinters } from './linterService.js';
 import { generateReview, ReviewGenerationError } from './aiProviderService.js';
+import { validateGitHubRepository, ValidationError } from './validationService.js';
+import { scanForSecrets } from './secretScanner.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -35,17 +38,29 @@ const MAX_FILES_IN_PROMPT = 20;
  */
 
 /**
+ * @typedef {Object} SecretFinding
+ * @property {string} filePath
+ * @property {number} line
+ * @property {string} patternId
+ * @property {string} label
+ * @property {string} matchPreview  - Already redacted by secretScanner (safe to surface)
+ */
+
+/**
  * @typedef {Object} ReviewReport
- * @property {string}        repoUrl
- * @property {string[]}      languages
+ * @property {string}          repoUrl
+ * @property {string}          defaultBranch    - Actual default branch read from GitHub metadata
+ * @property {string[]}        languages
  * @property {'groq'|'gemini'} providerUsed
- * @property {string}        summary
- * @property {number}        score          - 0–100 code health score
- * @property {ReviewIssue[]} issues
- * @property {number}        secretsFound
- * @property {number}        lintIssuesFound
- * @property {object}        linterRuns     - Per-linter status summary
- * @property {string}        generatedAt
+ * @property {string}          summary
+ * @property {number}          score            - 0–100 code health score
+ * @property {ReviewIssue[]}   issues
+ * @property {number}          secretsFound
+ * @property {SecretFinding[]} secretFindings   - Redacted findings (safe to return to caller)
+ * @property {object[]}        validationWarnings - Warnings from repo metadata (archived, fork, large)
+ * @property {number}          lintIssuesFound
+ * @property {object}          linterRuns       - Per-linter status summary
+ * @property {string}          generatedAt
  */
 
 // ─── Prompt builder ───────────────────────────────────────────────────────────
@@ -86,12 +101,31 @@ Focus on:
 
 Be concise and actionable. Maximum 15 issues.`;
 
-function buildUserPrompt({ repoUrl, languages, lintResults, linterRuns }) {
+function buildUserPrompt({ repoUrl, languages, lintResults, linterRuns, secretScanWarnings, validationWarnings }) {
   const lines = [];
 
   lines.push(`## Repository: ${repoUrl}`);
   lines.push(`## Detected Languages: ${languages.join(', ') || 'unknown'}`);
   lines.push('');
+
+  // ── Validation warnings (archived, fork, large repo, etc.) ───────────────
+  if (validationWarnings && validationWarnings.length > 0) {
+    lines.push('## Repository Metadata Warnings');
+    for (const w of validationWarnings) {
+      lines.push(`- [${w.code}] ${w.message}`);
+    }
+    lines.push('');
+  }
+
+  // ── Secret scan warnings (non-blocking — only shown if scanner ran but
+  //    somehow produced no blocking findings, e.g. stats/skipped notices) ──
+  if (secretScanWarnings && secretScanWarnings.length > 0) {
+    lines.push('## Secret Scan Notices');
+    for (const w of secretScanWarnings) {
+      lines.push(`- ${w}`);
+    }
+    lines.push('');
+  }
 
   // ── Linter run summary ───────────────────────────────────────────────────
   lines.push('## Linter Run Summary');
@@ -195,21 +229,6 @@ function parseAiResponse(text) {
   };
 }
 
-// ─── GitHub URL parser ────────────────────────────────────────────────────────
-
-function parseGitHubUrl(repoUrl) {
-  const match = repoUrl
-    .trim()
-    .replace(/\.git$/, '')
-    .match(/github\.com[/:]([^/]+)\/([^/]+)/);
-
-  if (!match) {
-    throw new Error(`Invalid GitHub repository URL: ${repoUrl}`);
-  }
-
-  return { owner: match[1], repo: match[2] };
-}
-
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -217,50 +236,97 @@ function parseGitHubUrl(repoUrl) {
  *
  * @param {object}  options
  * @param {string}  options.repoUrl      - e.g. https://github.com/owner/repo
- * @param {string}  [options.branch]     - Branch to review (default: main)
+ * @param {string}  [options.branch]     - Branch to review; defaults to the repo's actual
+ *                                        default_branch read from GitHub metadata.
+ *                                        Pass explicitly to review a feature branch.
  * @param {string}  [options.githubToken]- GitHub PAT for private repos
  * @returns {Promise<ReviewReport>}
  */
-export async function reviewRepository({ repoUrl, branch = 'main', githubToken }) {
-  const { owner, repo } = parseGitHubUrl(repoUrl);
+export async function reviewRepository({ repoUrl, branch, githubToken }) {
 
-  // ── Step 1: Fetch repo ─────────────────────────────────────────────────────
+  // ── Step 1: Validate repo via GitHub API ──────────────────────────────────
+  // Checks: URL format, gist rejection, rate-limit, repo existence, 401/403,
+  // empty repo, archived flag, fork notice, default_branch, repo size.
+  const {
+    owner,
+    repo,
+    defaultBranch,
+    metadata,
+    warnings: validationWarnings,
+  } = await validateGitHubRepository(repoUrl, { githubToken });
+
+  // Prefer an explicit branch override from the caller; fall back to the
+  // actual default branch from GitHub metadata (never hardcode 'main').
+  const targetBranch = branch ?? defaultBranch;
+
+  // ── Step 2: Fetch & extract repo ──────────────────────────────────────────
+  // Pass metadata.size so repoService can enforce the pre-download size cap
+  // without re-fetching metadata.
   const { sourceRoot, cleanup } = await fetchAndExtractRepo({
     owner,
     repo,
-    branch,
+    branch: targetBranch,
     githubToken,
+    maxRepoSizeKb: typeof metadata.size === 'number' ? metadata.size : null,
   });
 
   try {
-    // ── Step 2 + 3: Lint (secrets scanner can be added here later) ────────────
+    // ── Step 3: Scan for secrets ─────────────────────────────────────────────
+    // Must run BEFORE linting and before any AI call so we never send secrets
+    // to an external provider.
+    const secretScanResult = await scanForSecrets(sourceRoot);
+
+    if (secretScanResult.findings.length > 0) {
+      // Surface the redacted findings to the caller — matchPreview values are
+      // already truncated to 6 chars + '***REDACTED***' by the scanner.
+      throw new ValidationError(
+        `Secret scan detected ${secretScanResult.findings.length} potential secret(s) in the repository. ` +
+        'Review aborted to prevent leaking credentials to the AI provider.',
+        {
+          code: 'SECRETS_FOUND',
+          statusCode: 422,
+          details: {
+            findingsCount: secretScanResult.findings.length,
+            findings: secretScanResult.findings,  // redacted previews only
+            scanStats: secretScanResult.stats,
+          },
+        },
+      );
+    }
+
+    // ── Step 4: Run all linters ───────────────────────────────────────────────
     const { results: lintResults, runs: linterRuns, detection } = await runLinters(sourceRoot);
 
     const totalLintIssues = lintResults.reduce((sum, f) => sum + f.issues.length, 0);
 
-    // ── Step 4: Build prompt ──────────────────────────────────────────────────
+    // ── Step 5: Build prompt ──────────────────────────────────────────────────
     const userPrompt = buildUserPrompt({
       repoUrl,
       languages: detection.languages,
       lintResults,
       linterRuns,
+      secretScanWarnings: secretScanResult.warnings,  // non-fatal scanner notices
+      validationWarnings,
     });
 
-    // ── Step 5: Call AI ───────────────────────────────────────────────────────
+    // ── Step 6: Call AI ───────────────────────────────────────────────────────
     const { text, providerUsed } = await generateReview(SYSTEM_PROMPT, userPrompt);
 
-    // ── Step 6: Parse & assemble report ──────────────────────────────────────
+    // ── Step 7: Parse & assemble report ──────────────────────────────────────
     const { summary, score, issues } = parseAiResponse(text);
 
     /** @type {ReviewReport} */
     const report = {
       repoUrl,
+      defaultBranch: targetBranch,
       languages: detection.languages,
       providerUsed,
       summary,
       score,
       issues,
-      secretsFound: 0,       // secret scanner integration point
+      secretsFound: secretScanResult.stats.findingsCount,
+      secretFindings: [],   // empty — pipeline only reaches here when zero secrets found
+      validationWarnings,
       lintIssuesFound: totalLintIssues,
       linterRuns: linterRuns.map((r) => ({
         linter: r.linter,
@@ -273,7 +339,9 @@ export async function reviewRepository({ repoUrl, branch = 'main', githubToken }
 
     return report;
   } finally {
-    // Always clean up temp directory
+    // Always clean up temp directory regardless of outcome
     await cleanup();
   }
 }
+
+export { ValidationError, RepoFetchError, ReviewGenerationError };
