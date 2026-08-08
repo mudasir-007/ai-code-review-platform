@@ -1,149 +1,89 @@
-import fs from 'node:fs/promises';
+/**
+ * fileScanner.js
+ *
+ * Thin wrapper around repoWalker that collects all scannable source files
+ * from an extracted repository root.
+ *
+ * Previously this module contained its own directory-walk implementation.
+ * That logic has been retired in favour of repoWalker.js, which has a more
+ * complete ignore list, configurable depth/file caps, and no depth-exceeded
+ * recursion bug.
+ */
+
 import path from 'node:path';
+import { walkRepo } from '../utils/repoWalker.js';
 
-const SKIPPED_DIRECTORIES = new Set([
-  'node_modules',
-  '.git',
-  'dist',
-  'build',
-  '__pycache__',
-  'vendor',
-  '.next',
-]);
-
-const BINARY_EXTENSIONS = new Set([
-  '.png',
-  '.jpg',
-  '.jpeg',
-  '.gif',
-  '.webp',
-  '.ico',
-  '.bmp',
-  '.svg',
-  '.pdf',
-  '.exe',
-  '.dll',
-  '.so',
-  '.dylib',
-  '.bin',
-  '.zip',
-  '.tar',
-  '.gz',
-  '.7z',
-  '.rar',
-  '.mp3',
-  '.mp4',
-  '.wav',
-  '.avi',
-  '.mov',
-  '.woff',
-  '.woff2',
-  '.ttf',
-  '.eot',
-  '.otf',
-]);
+// ---------------------------------------------------------------------------
+// Scannable file extensions — everything a code-review tool cares about
+// ---------------------------------------------------------------------------
 
 const SOURCE_EXTENSIONS = new Set([
-  '.js',
-  '.mjs',
-  '.cjs',
-  '.jsx',
-  '.ts',
-  '.tsx',
+  // JavaScript / TypeScript
+  '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx',
+  // Python
   '.py',
+  // Rust
   '.rs',
+  // Go
   '.go',
-  '.java',
-  '.kt',
-  '.kts',
-  '.rb',
-  '.php',
-  '.cs',
-  '.cpp',
-  '.cc',
-  '.cxx',
-  '.c',
-  '.h',
-  '.hpp',
-  '.swift',
-  '.scala',
-  '.sh',
-  '.bash',
-  '.zsh',
-  '.sql',
-  '.vue',
-  '.svelte',
-  '.lua',
-  '.r',
-  '.dart',
-  '.yaml',
-  '.yml',
-  '.toml',
-  '.json',
-  '.md',
+  // JVM
+  '.java', '.kt', '.kts', '.scala',
+  // C / C++
+  '.c', '.h', '.cpp', '.cc', '.cxx', '.hpp',
+  // Web
+  '.vue', '.svelte',
+  // Ruby / PHP / C#
+  '.rb', '.php', '.cs',
+  // Shell
+  '.sh', '.bash', '.zsh',
+  // Mobile
+  '.swift', '.dart',
+  // Data / Config (still useful for AI review)
+  '.sql', '.lua', '.r',
+  '.yaml', '.yml', '.toml', '.json', '.md',
 ]);
 
-const MAX_FILES = 1000;
-const MAX_DEPTH = 10;
+/** Hard cap on files returned — guards against enormous monorepos. */
+const MAX_FILES = 5_000;
 
-function isBinaryFile(fileName) {
-  const ext = path.extname(fileName).toLowerCase();
-  return BINARY_EXTENSIONS.has(ext);
-}
+/** Hard cap on directory depth — prevents runaway traversal. */
+const MAX_DEPTH = 20;
 
-function isSourceFile(fileName) {
-  const ext = path.extname(fileName).toLowerCase();
-  return SOURCE_EXTENSIONS.has(ext);
-}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /**
- * Recursively walks extracted source and returns relative source file paths.
+ * Recursively walks an extracted repository source root and returns all
+ * scannable source file paths (relative to `sourceRoot`).
+ *
+ * Respects the canonical ignore list from repoWalker (node_modules, .git,
+ * dist, build, __pycache__, .venv, target, vendor, etc.).
+ *
+ * @param {string} sourceRoot - Absolute path to the extracted repo root
+ * @returns {Promise<{
+ *   files: string[],
+ *   warnings: string[],
+ *   stats: { totalFiles: number, stoppedEarly: boolean, maxFiles: number, maxDepth: number }
+ * }>}
  */
 export async function walkSourceFiles(sourceRoot) {
-  const files = [];
   const warnings = [];
-  let stoppedEarly = false;
 
-  async function visit(currentDir, depth) {
-    if (stoppedEarly) return;
+  const files = await walkRepo(sourceRoot, {
+    maxDepth: MAX_DEPTH,
+    maxFiles: MAX_FILES,
+    extensions: [...SOURCE_EXTENSIONS],
+  });
 
-    if (depth > MAX_DEPTH) {
-      warnings.push(`Directory depth exceeded ${MAX_DEPTH} at: ${path.relative(sourceRoot, currentDir) || '.'}`);
-    }
+  const stoppedEarly = files.length >= MAX_FILES;
 
-    let entries;
-    try {
-      entries = await fs.readdir(currentDir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
-    for (const entry of entries) {
-      if (stoppedEarly) break;
-
-      const absolutePath = path.join(currentDir, entry.name);
-
-      if (entry.isDirectory()) {
-        if (SKIPPED_DIRECTORIES.has(entry.name)) continue;
-        await visit(absolutePath, depth + 1);
-        continue;
-      }
-
-      if (!entry.isFile()) continue;
-      if (isBinaryFile(entry.name)) continue;
-      if (!isSourceFile(entry.name)) continue;
-
-      files.push(path.relative(sourceRoot, absolutePath));
-
-      if (files.length >= MAX_FILES) {
-        warnings.push(`File count exceeded ${MAX_FILES}. Scan stopped early.`);
-        stoppedEarly = true;
-        break;
-      }
-    }
+  if (stoppedEarly) {
+    warnings.push(
+      `File count reached the cap of ${MAX_FILES}. Scan stopped early — ` +
+      'some files may not have been reviewed.',
+    );
   }
-
-  await visit(sourceRoot, 0);
 
   return {
     files,
@@ -155,4 +95,12 @@ export async function walkSourceFiles(sourceRoot) {
       maxDepth: MAX_DEPTH,
     },
   };
+}
+
+/**
+ * Helper to get the relative path of a file from the source root.
+ * Convenience re-export for callers that previously used fileScanner directly.
+ */
+export function getRelativePath(sourceRoot, absoluteFilePath) {
+  return path.relative(sourceRoot, absoluteFilePath);
 }
