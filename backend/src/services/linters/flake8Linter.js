@@ -5,7 +5,7 @@
  */
 
 import path from 'node:path';
-import { execFileAsync, LINTER_TIMEOUT_MS, relPath } from './shared.js';
+import { safeExec, LINTER_TIMEOUT_MS, relPath } from './shared.js';
 import { walkRepo } from '../../utils/repoWalker.js';
 
 export const EXTENSIONS = ['.py'];
@@ -50,7 +50,9 @@ export async function run(repoRoot) {
   if (files.length === 0) return [];
 
   const absoluteFiles = files.map((file) => path.join(repoRoot, file));
-  const { stdout } = await execFileAsync(
+  // flake8 exits 1 whenever it finds any violation — safeExec absorbs the
+  // non-zero exit code and still returns stdout so we can parse the results.
+  const { stdout } = await safeExec(
     'flake8',
     [...absoluteFiles, '--format=default'],
     {

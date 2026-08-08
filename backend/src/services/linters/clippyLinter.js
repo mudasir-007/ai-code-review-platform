@@ -4,7 +4,7 @@
  * Cargo Clippy runner for Rust files.
  */
 
-import { execFileAsync, LINTER_TIMEOUT_MS, normalizeSeverity, relPath } from './shared.js';
+import { safeExec, LINTER_TIMEOUT_MS, normalizeSeverity, relPath } from './shared.js';
 import { findManifestDirectories } from '../../utils/repoWalker.js';
 
 export const EXTENSIONS = ['.rs'];
@@ -38,7 +38,9 @@ function normalizeClippyMessages(messages, repoRoot) {
 }
 
 async function runClippyInProject(projectRoot, repoRoot) {
-  const { stdout } = await execFileAsync(
+  // cargo clippy exits non-zero when warnings are present under #[deny(clippy::...)]
+  // or similar strict configs. safeExec absorbs the non-zero exit and returns stdout.
+  const { stdout } = await safeExec(
     'cargo',
     ['clippy', '--message-format=json', '--quiet'],
     {
