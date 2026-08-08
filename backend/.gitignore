@@ -5,11 +5,14 @@ dist/
 *.log
 .DS_Store
 
-cat >> backend/.gitignore << 'EOF'
+# IDE / agent config — not part of the project source
 .agents/
 .claude/
 .windsurf/
 skills-lock.json
+
+# TypeScript compilation output
 tsconfig.json
+
+# Internal design artifacts
 src/flowCharts/
-EOF
