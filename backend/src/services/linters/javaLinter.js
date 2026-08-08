@@ -9,7 +9,9 @@
  * inside the checkstyle JAR — no external file needed).
  */
 
+import path from 'node:path';
 import { safeExec, LINTER_TIMEOUT_MS, normalizeSeverity, relPath } from './shared.js';
+import { walkRepo } from '../../utils/repoWalker.js';
 
 export const EXTENSIONS = ['.java'];
 export const MANIFESTS = ['pom.xml', 'build.gradle', 'build.gradle.kts'];
@@ -78,11 +80,19 @@ function parseCheckstyleXml(xml, repoRoot) {
  * @returns {Promise<import('../linterService.js').LintFileResult[]>}
  */
 export async function run(repoRoot) {
-  // -r = recursively check directory; /google_checks.xml is bundled in the JAR
-  // Checkstyle exits 1 when violations found; output is in stdout
+  // Use walkRepo to collect only project Java files — this respects the standard
+  // ignore list (target/, build/, node_modules/, etc.) so we never lint
+  // generated build artifacts or third-party dependencies.
+  const files = await walkRepo(repoRoot, { extensions: EXTENSIONS });
+  if (files.length === 0) return [];
+
+  const absoluteFiles = files.map((f) => path.join(repoRoot, f));
+
+  // -f xml = XML output format; /google_checks.xml is bundled in the checkstyle JAR.
+  // Checkstyle exits 1 when violations are found — safeExec absorbs the non-zero exit.
   const { stdout } = await safeExec(
     'checkstyle',
-    ['-f', 'xml', '-c', '/google_checks.xml', '-r', '.'],
+    ['-f', 'xml', '-c', '/google_checks.xml', ...absoluteFiles],
     { cwd: repoRoot, timeout: LINTER_TIMEOUT_MS, maxBuffer: 20 * 1024 * 1024 },
   );
 
