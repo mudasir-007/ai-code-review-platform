@@ -1,11 +1,11 @@
 import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
-import 'dotenv/config';
 
 import authRoutes from './routes/authRoutes.js';
 import repositoryRoutes from './routes/repositoryRoutes.js';
 import githubAuthRoutes from './routes/githubAuth.js';
+import reviewRoutes from './routes/reviewRoutes.js';
 
 const app = express();
 
@@ -21,6 +21,9 @@ app.use('/api/auth', authRoutes);
 app.use('/api/auth', githubAuthRoutes);
 
 app.use('/api/repositories', repositoryRoutes);
+
+//* AI code review pipeline
+app.use('/api/review', reviewRoutes);
 
 app.get('/', (req, res) => {
   res.send('AI Code Review API is running');
