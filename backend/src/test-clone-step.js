@@ -157,6 +157,46 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// Test 7 — secretScanner ignores README.md and .env.example (no false positives)
+// ---------------------------------------------------------------------------
+console.log('\n[7] secretScanner — README.md and .env.example are skipped');
+const docsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'secret-docs-'));
+try {
+  // README.md with placeholder credentials — should produce zero findings
+  await fs.writeFile(path.join(docsDir, 'README.md'), [
+    '# My Project',
+    '',
+    'Set the following environment variables:',
+    '```',
+    'GROQ_API_KEY=your_groq_api_key_here',
+    'api_key="your_api_key_goes_here_replace_this_value"',
+    '```',
+  ].join('\n'));
+
+  // .env.example with placeholder credentials — should produce zero findings
+  await fs.writeFile(path.join(docsDir, '.env.example'), [
+    '# Copy this file to .env and fill in real values',
+    'DATABASE_URL=postgres://user:password@localhost:5432/mydb',
+    'GROQ_API_KEY=your_groq_api_key_here',
+    'JWT_SECRET="your_super_secret_jwt_key_here_replace_me"',
+  ].join('\n'));
+
+  // A real source file with a clean config — should also produce zero findings
+  await fs.writeFile(path.join(docsDir, 'index.js'), [
+    '// Entry point',
+    'export default function main() {}',
+  ].join('\n'));
+
+  const result = await scanForSecrets(docsDir);
+
+  assert(result.findings.length === 0, 'no findings from README.md or .env.example placeholder content');
+  assert(result.stats.skippedFiles >= 2, `README.md and .env.example counted as skipped (got ${result.stats.skippedFiles})`);
+} finally {
+  await fs.rm(docsDir, { recursive: true, force: true });
+}
+
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 console.log(`\n${'─'.repeat(50)}`);
