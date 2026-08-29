@@ -47,7 +47,7 @@ const SECRET_PATTERNS = [
   {
     id: 'slack_token',
     label: 'Slack Token',
-    pattern: /\b(xox[baprs]-[0-9A-Za-z\-]{10,})\b/g,
+    pattern: /\b(xox[baprs]-[0-9A-Za-z-]{10,})\b/g,
   },
   {
     id: 'stripe_key',
@@ -81,10 +81,10 @@ const SCANNABLE_EXTENSIONS = new Set([
   '.js', '.mjs', '.cjs', '.jsx',
   '.ts', '.tsx',
   '.py', '.rb', '.php', '.go', '.rs', '.java', '.kt', '.swift', '.cs',
-  '.sh', '.bash', '.zsh', '.env', '.env.example', '.env.local', '.env.production',
+  '.sh', '.bash', '.zsh', '.env', '.env.local', '.env.production',
   '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
   '.json', '.xml',
-  '.md', '.txt',
+  '.txt',
   '.dockerfile', '.Dockerfile',
 ]);
 
@@ -95,18 +95,66 @@ const MAX_FILE_READ_BYTES = 512 * 1024; // 512 KB
 const MAX_FILES_TO_SCAN = 5000;
 
 // ---------------------------------------------------------------------------
+// Documentation / example files to NEVER scan (would cause false positives)
+// ---------------------------------------------------------------------------
+
+/**
+ * Exact basenames (case-insensitive) that should always be skipped.
+ * These files often contain placeholder credentials used as documentation
+ * examples, not real secrets.
+ */
+const IGNORED_FILE_NAMES = new Set([
+  'readme.md',
+  '.env.example',
+  '.env.sample',
+  '.env.template',
+  'env.example',
+  'env.sample',
+  'env.template',
+]);
+
+/**
+ * File extensions (case-insensitive) that should always be skipped.
+ * .md  — Markdown documentation (README, CHANGELOG, etc.)
+ * .example — Template / sample files (config.yml.example, etc.)
+ */
+const IGNORED_EXTENSIONS = new Set(['.md', '.example']);
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Returns true when a file should be excluded from secret scanning because
+ * it is a documentation or example/template file.
+ * Checked BEFORE isScannableFile so it acts as an early-exit gate.
+ */
+function isIgnoredFile(filePath) {
+  const base = path.basename(filePath).toLowerCase();
+
+  // Match by exact filename (e.g. README.md, .env.example)
+  if (IGNORED_FILE_NAMES.has(base)) return true;
+
+  // Match by extension (e.g. *.md, *.example)
+  const ext = path.extname(filePath).toLowerCase();
+  if (IGNORED_EXTENSIONS.has(ext)) return true;
+
+  return false;
+}
 
 function isScannableFile(filePath) {
   const base = path.basename(filePath).toLowerCase();
 
-  // Explicitly named .env files (no extension)
-  if (base === '.env' || base.startsWith('.env.')) return true;
+  // Explicitly named .env files (no extension), but NOT .env.example / .env.sample etc.
+  // Those are caught by isIgnoredFile() before this function is ever reached,
+  // but we guard here too so the function stays correct in isolation.
+  if (base === '.env') return true;
+  if (base.startsWith('.env.') && !IGNORED_FILE_NAMES.has(base)) return true;
 
   const ext = path.extname(filePath).toLowerCase();
   return SCANNABLE_EXTENSIONS.has(ext);
 }
+
 
 /**
  * Scans a single file's content against all secret patterns.
@@ -193,10 +241,19 @@ export async function scanForSecrets(sourceRoot) {
   });
 
   for (const relativeFilePath of allFiles) {
+    // Skip documentation and example/template files — they frequently contain
+    // placeholder credentials that are not real secrets (e.g. README.md,
+    // .env.example with "your_api_key_here" values).
+    if (isIgnoredFile(relativeFilePath)) {
+      skippedFiles++;
+      continue;
+    }
+
     if (!isScannableFile(relativeFilePath)) {
       skippedFiles++;
       continue;
     }
+
 
     const absolutePath = path.join(sourceRoot, relativeFilePath);
 
