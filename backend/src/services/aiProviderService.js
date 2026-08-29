@@ -3,8 +3,8 @@
  *
  * Multi-provider AI client with automatic fallback.
  *
- * Primary:  Groq → llama-3.3-70b-versatile  (fastest, 14,400 req/day free)
- * Fallback: Gemini → gemini-2.5-flash        (500 req/day free)
+ * Primary:  Groq → openai/gpt-oss-120b  (fastest, on-demand)
+ * Fallback: Gemini → gemini-3.6-flash    (500 req/day free)
  *
  * Fallback triggers:
  *   - Groq rate limit (429)
@@ -17,8 +17,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // ─── Models ───────────────────────────────────────────────────────────────────
 
-const GROQ_MODEL   = 'llama-3.3-70b-versatile';
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GROQ_MODEL   = 'openai/gpt-oss-120b';  // llama-3.3-70b-versatile removed; gpt-oss-120b is the strongest available on this account
+const GEMINI_MODEL = 'gemini-3.6-flash';     // gemini-2.5-flash deprecated by Google — replaced by gemini-3.6-flash
 
 // Token budgets (leave headroom for prompt + output)
 const GROQ_MAX_TOKENS   = 2048;
@@ -101,9 +101,8 @@ function isRateLimit(err) {
  * @returns {Promise<{ text: string; providerUsed: 'groq' | 'gemini' }>}
  */
 export async function generateReview(systemPrompt, userPrompt) {
-  let groqError = null;
-
   // ── Try Groq ──────────────────────────────────────────────────────────────
+  let groqError;
   try {
     const text = await callGroq(systemPrompt, userPrompt);
     return { text, providerUsed: 'groq' };
@@ -114,7 +113,7 @@ export async function generateReview(systemPrompt, userPrompt) {
   }
 
   // ── Fallback to Gemini ────────────────────────────────────────────────────
-  let geminiError = null;
+  let geminiError;
   try {
     const text = await callGemini(systemPrompt, userPrompt);
     return { text, providerUsed: 'gemini' };
