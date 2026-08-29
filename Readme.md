@@ -4,34 +4,34 @@
 
 ---
 
-## ✅ What's Built
+##  What's Built
 
 | Stage | Feature | Status |
 |---|---|---|
-| Auth | JWT registration / login | ✅ Done |
-| Auth | GitHub OAuth | ✅ Done |
-| Repo | GitHub URL validation | ✅ Done |
-| Repo | Zipball fetch + temp dir extraction | ✅ Done |
-| Repo | Repo size enforcement (200 MB cap) | ✅ Done |
-| Linting | Language auto-detection (14 languages) | ✅ Done |
-| Linting | ESLint 10 (JS / TypeScript) | ✅ Done |
-| Linting | Flake8 (Python) | ✅ Done |
-| Linting | Cargo Clippy (Rust) | ✅ Done |
-| Linting | golangci-lint (Go) | ✅ Done |
-| Linting | Checkstyle (Java) | ✅ Done |
-| Linting | RuboCop (Ruby) | ✅ Done |
-| Linting | PHP_CodeSniffer (PHP) | ✅ Done |
-| Linting | Cppcheck (C / C++) | ✅ Done |
-| Linting | SwiftLint (Swift) | ✅ Done |
-| Linting | ktlint (Kotlin) | ✅ Done |
-| Linting | ShellCheck (Shell / Bash) | ✅ Done |
-| Linting | SQLFluff (SQL / PostgreSQL, dialect auto-detected) | ✅ Done |
-| Linting | Built-in MongoDB analyzer (no binary needed) | ✅ Done |
-| Linting | Fault isolation (one linter failing never kills others) | ✅ Done |
-| AI | Groq — Llama 3.3-70b (primary, fastest) | ✅ Done |
-| AI | Gemini 2.5 Flash (automatic fallback) | ✅ Done |
-| AI | Structured JSON review report (score, issues, suggestions) | ✅ Done |
-| API | `POST /api/review` — full pipeline endpoint | ✅ Done |
+| Auth | JWT registration / login |  Done |
+| Auth | GitHub OAuth |  Done |
+| Repo | GitHub URL validation |  Done |
+| Repo | Zipball fetch + temp dir extraction |  Done |
+| Repo | Repo size enforcement (200 MB cap) |  Done |
+| Linting | Language auto-detection (14 languages) |  Done |
+| Linting | ESLint 10 (JS / TypeScript) |  Done |
+| Linting | Flake8 (Python) |  Done |
+| Linting | Cargo Clippy (Rust) |  Done |
+| Linting | golangci-lint (Go) |  Done |
+| Linting | Checkstyle (Java) |  Done |
+| Linting | RuboCop (Ruby) |  Done |
+| Linting | PHP_CodeSniffer (PHP) |  Done |
+| Linting | Cppcheck (C / C++) |  Done |
+| Linting | SwiftLint (Swift) |  Done |
+| Linting | ktlint (Kotlin) |  Done |
+| Linting | ShellCheck (Shell / Bash) |  Done |
+| Linting | SQLFluff (SQL / PostgreSQL, dialect auto-detected) |  Done |
+| Linting | Built-in MongoDB analyzer (no binary needed) |  Done |
+| Linting | Fault isolation (one linter failing never kills others) |  Done |
+| AI | Groq — Llama 3.3-70b (primary, fastest) |  Done |
+| AI | Gemini 2.5 Flash (automatic fallback) |  Done |
+| AI | Structured JSON review report (score, issues, suggestions) |  Done |
+| API | `POST /api/review` — full pipeline endpoint |  Done |
 | Frontend | UI dashboard | 🔜 Next |
 
 ---
@@ -68,7 +68,7 @@ POST /api/review  { repoUrl, branch?, githubToken? }
 └────────┬───────────────────┘
          ▼
 ┌─────────────────┐
-│  ReviewReport   │  summary · score · issues[] · suggestions
+│  ReviewReport   │  summary · score · issues[] ·           suggestions
 └─────────────────┘
 ```
 
@@ -327,3 +327,70 @@ node src/test-clone-step.js
 ## License
 
 ISC
+
+
+
+
+
+
+
+
+
+# AI Code Review — Frontend
+
+React + Tailwind. Talks to the existing `backend/` Express API.
+
+## Setup
+
+```bash
+npm install
+npm run dev
+```
+
+Runs on `http://localhost:5173`. The dev server proxies `/api/*` requests to
+`http://localhost:5050` (your Express backend) — start the backend first,
+then this.
+
+## Preview without a running backend
+
+Two screens are hard to see without a real (and possibly slow) review run —
+visit:
+
+- `http://localhost:5173/?demo=report` — the full report screen with sample data
+- `http://localhost:5173/?demo=blocked` — the secrets-blocked screen
+
+Sample data lives in `src/mockData.js`, shaped exactly like the real API
+response so nothing here needs to change once you're wired up for real.
+
+## Structure
+
+```
+src/
+  api.js                    fetch wrapper for POST /api/review
+  mockData.js                sample data for the demo screens above
+  App.jsx                    screen state machine (input → running → report/blocked/error)
+  components/
+    UrlInput.jsx              screen 1: paste a repo URL
+    PipelineProgress.jsx      screen 2: staged progress (validate/clone/scan/lint/AI)
+    ReportView.jsx            screen 3: full report
+    ScoreGauge.jsx              radial code-health score
+    IssueCard.jsx                per-file issue groups, severity-colored rail
+    LinterRunPanel.jsx           collapsible per-linter status
+    BlockedSecrets.jsx        screen 4: secrets found, review stopped
+    ErrorState.jsx            screen 5: per-error-code messaging
+```
+
+## Notes on the progress screen
+
+`PipelineProgress` currently advances on a timer (1.8s per stage) since the
+backend doesn't stream real progress events yet. If you add SSE or WebSocket
+progress updates to `POST /api/review` later, swap the `setInterval` in
+`App.jsx`'s `handleSubmit` for real stage events — the component itself
+already takes `activeIndex` as a prop, so no visual changes needed.
+
+## Design tokens
+
+Defined in `tailwind.config.js`. Colors are tied to severity semantics
+(error/warning/info/ok) plus one accent (`signal`) for interactive elements —
+not a decorative palette. See the design plan in the original prompt for the
+reasoning.

@@ -1,6 +1,8 @@
 // Quick unit tests for the repo clone step completion
 // Tests: size guard, INVALID_INPUT, secretScanner patterns, fileScanner wiring
 
+import 'dotenv/config';  // Load environment variables from .env
+
 import { fetchAndExtractRepo, RepoFetchError } from './services/repoService.js';
 import { scanForSecrets } from './services/secretScanner.js';
 import { walkSourceFiles } from './services/fileScanner.js';
@@ -71,13 +73,27 @@ console.log('\n[4] secretScanner — pattern detection');
 const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'secret-test-'));
 
 try {
+  // Read dummy secrets from environment variables
+  const testSecrets = {
+    githubToken: process.env.TEST_GITHUB_TOKEN,
+    awsKey: process.env.TEST_AWS_ACCESS_KEY_ID,
+    genericApiKey: process.env.TEST_GENERIC_API_KEY,
+  };
+
+  // Ensure all required test secrets are present
+  for (const [name, value] of Object.entries(testSecrets)) {
+    if (!value) {
+      throw new Error(`Missing environment variable for test secret: ${name}`);
+    }
+  }
+
   // Write a fake source file with a mix of secrets and innocent lines
   await fs.writeFile(path.join(tmpDir, 'config.js'), [
     '// config.js',
     'const DB_HOST = "localhost";',
-    'const GITHUB_TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz123456ABCD";',
-    'const AWS_KEY = "AKIAIOSFODNN7EXAMPLE";',
-    'const api_key = "super-secret-api-key-value-here";',
+    `const GITHUB_TOKEN = "${testSecrets.githubToken}";`,
+    `const AWS_KEY = "${testSecrets.awsKey}";`,
+    `const api_key = "${testSecrets.genericApiKey}";`,
     'module.exports = { DB_HOST };',
   ].join('\n'));
 
