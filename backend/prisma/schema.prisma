@@ -27,6 +27,41 @@ model Repository {
   private   Boolean  @default(false)
   userId    String
   user      User     @relation(fields: [userId], references: [id])
+
+  // ── Incremental review tracking ─────────────────────────────────────────
+  // The commit SHA (on lastReviewedBranch) that was reviewed last. When a
+  // new review is triggered and this is set, only the diff between this SHA
+  // and the current HEAD is sent to the linter/AI steps instead of the
+  // whole repository.
+  lastReviewedSha    String?
+  lastReviewedBranch String?
+
+  reviews   Review[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model Review {
+  id           String     @id @default(uuid())
+  repositoryId String
+  repository   Repository @relation(fields: [repositoryId], references: [id])
+
+  // 'full' = whole-repo review (first review, or forced full re-review).
+  // 'incremental' = only baseSha..headSha diff was reviewed.
+  mode         String
+  baseSha      String?
+  headSha      String
+
+  score        Int
+  summary      String
+  issues       Json
+  changedFiles String[]
+
+  // Set once fixGenerationService + prService open a PR for this review.
+  prCreated    Boolean  @default(false)
+  prUrl        String?
+  prNumber     Int?
+
+  createdAt    DateTime @default(now())
 }
