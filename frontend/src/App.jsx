@@ -7,6 +7,7 @@ import PipelineProgress from './components/PipelineProgress.jsx';
 import ReportView from './components/ReportView.jsx';
 import BlockedSecrets from './components/BlockedSecrets.jsx';
 import ErrorState from './components/ErrorState.jsx';
+import RepositoriesPage from './components/RepositoriesPage.jsx';
 import { submitReview, ReviewApiError } from './api.js';
 import { MOCK_REPORT, MOCK_SECRETS_BLOCKED_ERROR } from './mockData.js';
 
@@ -44,6 +45,7 @@ function AppInner() {
   const { user, loading } = useAuth();
 
   const demo = getDemoParam();
+  const [tab, setTab] = useState('oneoff'); // 'oneoff' | 'repositories'
   const [screen, setScreen] = useState(
     demo === 'report' ? 'report' : demo === 'blocked' ? 'blocked' : 'input',
   );
@@ -105,20 +107,46 @@ function AppInner() {
       <AppHeader />
       {/* pt-14 offsets the fixed header height */}
       <div className="pt-14">
-        {screen === 'running' && (
-          <PipelineProgress activeIndex={stageIndex} repoUrl={repoUrl} />
-        )}
-        {screen === 'report' && report && (
-          <ReportView report={report} onNewReview={resetToInput} />
-        )}
-        {screen === 'blocked' && error && (
-          <BlockedSecrets error={error} onNewReview={resetToInput} />
-        )}
-        {screen === 'error' && error && (
-          <ErrorState error={error} onRetry={resetToInput} />
-        )}
-        {screen === 'input' && (
-          <UrlInput onSubmit={handleSubmit} disabled={false} />
+        <div className="flex justify-center gap-1 border-b border-border px-6 pt-4">
+          {[
+            { id: 'oneoff', label: 'One-off review' },
+            { id: 'repositories', label: 'Tracked repositories' },
+          ].map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setTab(t.id)}
+              className={`px-4 py-2 text-sm font-mono border-b-2 -mb-px transition-colors ${
+                tab === t.id
+                  ? 'border-signal text-signal'
+                  : 'border-transparent text-textMuted hover:text-text'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {tab === 'repositories' ? (
+          <RepositoriesPage />
+        ) : (
+          <>
+            {screen === 'running' && (
+              <PipelineProgress activeIndex={stageIndex} repoUrl={repoUrl} />
+            )}
+            {screen === 'report' && report && (
+              <ReportView report={report} onNewReview={resetToInput} />
+            )}
+            {screen === 'blocked' && error && (
+              <BlockedSecrets error={error} onNewReview={resetToInput} />
+            )}
+            {screen === 'error' && error && (
+              <ErrorState error={error} onRetry={resetToInput} />
+            )}
+            {screen === 'input' && (
+              <UrlInput onSubmit={handleSubmit} disabled={false} />
+            )}
+          </>
         )}
       </div>
     </>
