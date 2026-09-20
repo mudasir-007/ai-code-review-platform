@@ -32,7 +32,36 @@
 | AI | Gemini 2.5 Flash (automatic fallback) |  Done |
 | AI | Structured JSON review report (score, issues, suggestions) |  Done |
 | API | `POST /api/review` — full pipeline endpoint |  Done |
+| Review | Incremental (diff-only) re-review of a tracked repository |  Done |
+| Review | Auto-PR with AI-generated fixes when findings cross a threshold |  Done |
+| API | `POST /api/repositories/:id/review` — full first time, incremental after |  Done |
+| API | `GET /api/repositories/:id/reviews` — review history |  Done |
 | Frontend | UI dashboard | 🔜 Next |
+
+---
+
+## Incremental review & auto-fix PRs
+
+`POST /api/review` always reviews the whole repository — useful for a one-off check on any public
+URL, but expensive (in AI tokens) to run on every push to a repo you're tracking.
+
+For a tracked repository (one you've added via `POST /api/repositories`), use
+`POST /api/repositories/:id/review` instead:
+
+- **First call** — no `lastReviewedSha` stored yet → full review, same as `/api/review`.
+- **Every call after** — diffs the current HEAD against `lastReviewedSha` via GitHub's compare API,
+  lints only the changed files, and sends only the diff hunks (not whole files) to the AI. The new
+  findings are merged with the repository's previous issue list (stale entries for re-reviewed or
+  deleted files are dropped) so the report still reflects the whole repo, not just what changed.
+- If the stored `lastReviewedSha` no longer exists on GitHub (e.g. a force-push), the pipeline
+  automatically falls back to a full review instead of failing.
+- Pass `"forceFull": true` in the body to force a full review regardless of history.
+- Pass `"autoPr": true` to let the pipeline open a pull request with AI-generated fixes when the
+  findings cross the threshold in `scoringService` (tunable via `PR_SCORE_THRESHOLD` /
+  `PR_ISSUE_THRESHOLD` in `.env`). Requires a `githubToken` with `repo` (write) scope.
+
+Every review (full or incremental) is persisted as a `Review` row, and `Repository.lastReviewedSha`
+is updated after each one — see `prisma/schema.prisma`.
 
 ---
 
