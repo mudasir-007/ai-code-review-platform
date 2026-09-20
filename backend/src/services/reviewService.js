@@ -6,9 +6,10 @@
  *   2. Fetch & extract repo           (repoService)
  *   3. Scan for secrets               (secretScanner)   — blocks pipeline if secrets found
  *   4. Run all linters                (linterService)
- *   5. Build AI prompt
+ *   5. Build AI prompt — full repo, or (if baseSha is given) just the diff
  *   6. Call AI with fallback          (aiProviderService)
- *   7. Parse & return ReviewReport
+ *   7. Parse & assemble ReviewReport  — merging with previousIssues when incremental
+ *   8. If findings are bad enough and autoPr is on, open a fix PR (prService)
  */
 
 import { fetchAndExtractRepo, RepoFetchError } from './repoService.js';
@@ -16,6 +17,10 @@ import { runLinters } from './linterService.js';
 import { generateReview, ReviewGenerationError } from './aiProviderService.js';
 import { validateGitHubRepository, ValidationError } from './validationService.js';
 import { scanForSecrets } from './secretScanner.js';
+import { getLatestCommitSha, compareCommits, DiffError } from './githubDiffService.js';
+import { mergeFindings } from './mergeService.js';
+import { shouldOpenPr } from './scoringService.js';
+import { openFixPr } from './prService.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -181,6 +186,72 @@ function buildUserPrompt({ repoUrl, languages, lintResults, linterRuns, secretSc
   return lines.join('\n');
 }
 
+const SYSTEM_PROMPT_INCREMENTAL = `You are an expert code reviewer. You are reviewing ONLY the lines that changed in a set of commits, not the whole repository — files outside this diff were already reviewed previously and must not be re-flagged.
+
+IMPORTANT: You MUST respond with ONLY valid JSON — no markdown, no code fences, no prose before or after.
+
+Your response must match this exact schema:
+{
+  "summary": "<2-3 sentence verdict on THIS diff specifically>",
+  "score": <integer 0-100, health score of the changed code in this diff>,
+  "issues": [
+    {
+      "file": "<relative file path, must be one of the changed files>",
+      "line": <line number within the new version of the file, or null>,
+      "severity": "<error|warning|info>",
+      "category": "<security|lint|style|logic|performance>",
+      "message": "<what the problem is>",
+      "suggestion": "<how to fix it>"
+    }
+  ]
+}
+
+Scoring guide (for this diff only):
+- 90-100: Excellent, production-ready
+- 70-89:  Good, minor issues
+- 50-69:  Fair, several issues to address
+- 30-49:  Poor, significant problems
+- 0-29:   Critical issues, major rework needed
+
+Only flag issues introduced by, or clearly visible within, the diff hunks below. Do not comment on unchanged code you cannot see. Maximum 15 issues.`;
+
+function buildIncrementalUserPrompt({ repoUrl, changedFiles, lintResults }) {
+  const lines = [];
+  lines.push(`## Repository: ${repoUrl}`);
+  lines.push(`## Files changed in this diff: ${changedFiles.length}`);
+  lines.push('');
+
+  lines.push('## Diff');
+  for (const file of changedFiles) {
+    lines.push(`\n### ${file.filename} (${file.status})`);
+    if (file.previousFilename) lines.push(`renamed from: ${file.previousFilename}`);
+    if (file.patch) {
+      lines.push('```diff');
+      lines.push(file.patch);
+      lines.push('```');
+    } else {
+      lines.push('(no patch available — file is binary, or the diff is too large to inline; skip detailed review of this file)');
+    }
+  }
+
+  const relevantLint = lintResults.filter((f) =>
+    changedFiles.some((c) => c.filename === f.filePath),
+  );
+  if (relevantLint.length > 0) {
+    lines.push('\n## Lint findings for changed files');
+    for (const f of relevantLint) {
+      for (const issue of f.issues) {
+        lines.push(`  [${issue.severity.toUpperCase()}] ${f.filePath}:L${issue.line ?? '?'} [${issue.ruleId}] ${issue.message}`);
+      }
+    }
+  }
+
+  lines.push('');
+  lines.push('---');
+  lines.push('Review only the diff above and produce the structured JSON review report.');
+  return lines.join('\n');
+}
+
 // ─── Response parser ──────────────────────────────────────────────────────────
 
 function parseAiResponse(text) {
@@ -232,17 +303,26 @@ function parseAiResponse(text) {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Runs the full review pipeline against a GitHub repository.
+ * Runs the review pipeline against a GitHub repository — full or incremental.
  *
  * @param {object}  options
- * @param {string}  options.repoUrl      - e.g. https://github.com/owner/repo
- * @param {string}  [options.branch]     - Branch to review; defaults to the repo's actual
- *                                        default_branch read from GitHub metadata.
- *                                        Pass explicitly to review a feature branch.
- * @param {string}  [options.githubToken]- GitHub PAT for private repos
- * @returns {Promise<ReviewReport>}
+ * @param {string}  options.repoUrl        - e.g. https://github.com/owner/repo
+ * @param {string}  [options.branch]       - Branch to review; defaults to the repo's actual
+ *                                          default_branch read from GitHub metadata.
+ * @param {string}  [options.githubToken]  - GitHub PAT (repo scope needed for private repos / auto-PR)
+ * @param {string}  [options.baseSha]      - Previously reviewed commit sha. When provided, only the
+ *                                          diff between this sha and current HEAD is linted/reviewed.
+ *                                          Falls back to a full review if the diff can't be computed
+ *                                          (e.g. force-push moved history — see DiffError).
+ * @param {Array}   [options.previousIssues] - Issues carried over from the repository's last stored
+ *                                          Review, used to produce a merged/deduped issue list when
+ *                                          baseSha is set.
+ * @param {boolean} [options.autoPr]       - If true and findings cross scoringService's threshold,
+ *                                          open a PR with AI-generated fixes (requires a write-scoped
+ *                                          githubToken).
+ * @returns {Promise<ReviewReport & { mode: 'full'|'incremental', baseSha: string|null, headSha: string, changedFiles: string[], pr: object|null }>}
  */
-export async function reviewRepository({ repoUrl, branch, githubToken }) {
+export async function reviewRepository({ repoUrl, branch, githubToken, baseSha = null, previousIssues = [], autoPr = false }) {
 
   // ── Step 1: Validate repo via GitHub API ──────────────────────────────────
   // Checks: URL format, gist rejection, rate-limit, repo existence, 401/403,
@@ -259,7 +339,51 @@ export async function reviewRepository({ repoUrl, branch, githubToken }) {
   // actual default branch from GitHub metadata (never hardcode 'main').
   const targetBranch = branch ?? defaultBranch;
 
+  // ── Step 1b: Resolve current HEAD + diff, when this is an incremental run ──
+  // Done before the (expensive) zipball fetch so a force-push/rewrite can be
+  // detected and the caller can decide whether to retry as a full review.
+  const headSha = await getLatestCommitSha({ owner, repo, branch: targetBranch, githubToken });
+
+  let changedFiles = null; // null = full review; [] = incremental, nothing changed
+  if (baseSha) {
+    if (baseSha === headSha) {
+      changedFiles = [];
+    } else {
+      // Lets DiffError (e.g. BASE_NOT_COMPARABLE after a force-push) bubble up
+      // to the caller, which should retry with baseSha: null for a full review.
+      const diff = await compareCommits({ owner, repo, base: baseSha, head: headSha, githubToken });
+      changedFiles = diff.changedFiles;
+    }
+  }
+
+  // Nothing changed since the last review — skip linting/AI entirely.
+  if (changedFiles && changedFiles.length === 0) {
+    return {
+      repoUrl,
+      defaultBranch: targetBranch,
+      mode: 'incremental',
+      baseSha,
+      headSha,
+      changedFiles: [],
+      languages: [],
+      providerUsed: null,
+      summary: 'No changes since the last review.',
+      score: null,
+      issues: previousIssues,
+      secretsFound: 0,
+      secretFindings: [],
+      validationWarnings,
+      lintIssuesFound: previousIssues.length,
+      linterRuns: [],
+      generatedAt: new Date().toISOString(),
+      pr: null,
+    };
+  }
+
   // ── Step 2: Fetch & extract repo ──────────────────────────────────────────
+  // Still needed even for incremental reviews — the linters run against files
+  // on disk, and a fix PR needs the current file contents. Only the AI prompt
+  // (the expensive, token-metered step) is actually scoped down below.
   // Pass metadata.size so repoService can enforce the pre-download size cap
   // without re-fetching metadata.
   const { sourceRoot, cleanup } = await fetchAndExtractRepo({
@@ -295,30 +419,55 @@ export async function reviewRepository({ repoUrl, branch, githubToken }) {
     }
 
     // ── Step 4: Run all linters ───────────────────────────────────────────────
-    const { results: lintResults, runs: linterRuns, detection } = await runLinters(sourceRoot);
+    // Note: linters still run over the whole checkout (rewiring all 13 linter
+    // integrations to accept a file allowlist is future work) — but for an
+    // incremental run we immediately filter the *results* down to changed
+    // files below, so only relevant findings ever reach the prompt.
+    const { results: allLintResults, runs: linterRuns, detection } = await runLinters(sourceRoot);
+
+    const lintResults = changedFiles
+      ? allLintResults.filter((f) => changedFiles.some((c) => c.filename === f.filePath))
+      : allLintResults;
 
     const totalLintIssues = lintResults.reduce((sum, f) => sum + f.issues.length, 0);
 
     // ── Step 5: Build prompt ──────────────────────────────────────────────────
-    const userPrompt = buildUserPrompt({
-      repoUrl,
-      languages: detection.languages,
-      lintResults,
-      linterRuns,
-      secretScanWarnings: secretScanResult.warnings,  // non-fatal scanner notices
-      validationWarnings,
-    });
+    // Incremental: only diff hunks + lint findings for changed files.
+    // Full: whole-repo lint summary, as before.
+    const userPrompt = changedFiles
+      ? buildIncrementalUserPrompt({ repoUrl, changedFiles, lintResults })
+      : buildUserPrompt({
+          repoUrl,
+          languages: detection.languages,
+          lintResults,
+          linterRuns,
+          secretScanWarnings: secretScanResult.warnings,  // non-fatal scanner notices
+          validationWarnings,
+        });
 
     // ── Step 6: Call AI ───────────────────────────────────────────────────────
-    const { text, providerUsed } = await generateReview(SYSTEM_PROMPT, userPrompt);
+    const { text, providerUsed } = await generateReview(
+      changedFiles ? SYSTEM_PROMPT_INCREMENTAL : SYSTEM_PROMPT,
+      userPrompt,
+    );
 
     // ── Step 7: Parse & assemble report ──────────────────────────────────────
-    const { summary, score, issues } = parseAiResponse(text);
+    const { summary, score, issues: newIssues } = parseAiResponse(text);
+
+    // When incremental, merge this round's findings with the carried-over
+    // issue set (dropping stale entries for files that were just re-reviewed
+    // or removed) so the report still reflects the whole repo's outstanding
+    // issues, not just the two files someone happened to touch.
+    const issues = changedFiles ? mergeFindings(previousIssues, newIssues, changedFiles) : newIssues;
 
     /** @type {ReviewReport} */
     const report = {
       repoUrl,
       defaultBranch: targetBranch,
+      mode: changedFiles ? 'incremental' : 'full',
+      baseSha,
+      headSha,
+      changedFiles: changedFiles ? changedFiles.map((f) => f.filename) : [],
       languages: detection.languages,
       providerUsed,
       summary,
@@ -335,7 +484,28 @@ export async function reviewRepository({ repoUrl, branch, githubToken }) {
         reason: r.reason,
       })),
       generatedAt: new Date().toISOString(),
+      pr: null,
     };
+
+    // ── Step 8: Auto-PR, if requested and findings warrant it ────────────────
+    if (autoPr) {
+      const decision = shouldOpenPr(report);
+      if (decision.shouldOpenPr) {
+        report.pr = await openFixPr({
+          owner,
+          repo,
+          repoUrl,
+          baseBranch: targetBranch,
+          headSha,
+          sourceRoot,
+          issues: report.issues,
+          githubToken,
+        });
+        report.pr.reason = decision.reason;
+      } else {
+        report.pr = { opened: false, prUrl: null, prNumber: null, reason: decision.reason };
+      }
+    }
 
     return report;
   } finally {
@@ -344,4 +514,4 @@ export async function reviewRepository({ repoUrl, branch, githubToken }) {
   }
 }
 
-export { ValidationError, RepoFetchError, ReviewGenerationError };
+export { ValidationError, RepoFetchError, ReviewGenerationError, DiffError };
