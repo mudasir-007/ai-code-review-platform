@@ -1,6 +1,8 @@
 import ScoreGauge from './ScoreGauge.jsx';
 import IssueFileGroup from './IssueCard.jsx';
 import LinterRunPanel from './LinterRunPanel.jsx';
+import ModeBadge from './ModeBadge.jsx';
+import PrBanner from './PrBanner.jsx';
 
 function groupByFile(issues) {
   const map = new Map();
@@ -22,7 +24,7 @@ export default function ReportView({ report, onNewReview }) {
           <div className="min-w-0">
             <p className="font-mono text-xs text-textMuted mb-1 truncate">{report.repoUrl}</p>
             <p className="font-mono text-xs text-textMuted">
-              {report.defaultBranch} · reviewed with {report.providerUsed}
+              {report.defaultBranch} · reviewed with {report.providerUsed ?? 'cached result'}
             </p>
           </div>
           <button
@@ -35,12 +37,26 @@ export default function ReportView({ report, onNewReview }) {
           </button>
         </div>
 
+        {/* Mode badge — only present for tracked-repository reviews */}
+        {report.mode && (
+          <div className="mb-4">
+            <ModeBadge mode={report.mode} changedFiles={report.changedFiles} />
+          </div>
+        )}
+
+        {/* Auto-PR result — only present when autoPr was requested for this review */}
+        <PrBanner pr={report.pr} />
+
         {/* Score + summary */}
         <div className="rounded-lg border border-border bg-surface p-6 mb-6">
-          <ScoreGauge score={report.score} />
+          {report.score != null ? (
+            <ScoreGauge score={report.score} />
+          ) : (
+            <p className="text-textMuted font-mono text-sm">No score — nothing changed since the last review.</p>
+          )}
           <p className="text-text mt-5 leading-relaxed">{report.summary}</p>
 
-          {report.languages.length > 0 && (
+          {report.languages?.length > 0 && (
             <div className="flex flex-wrap gap-2 mt-4">
               {report.languages.map((lang) => (
                 <span
@@ -53,6 +69,22 @@ export default function ReportView({ report, onNewReview }) {
             </div>
           )}
         </div>
+
+        {/* Changed files — only present for incremental reviews */}
+        {report.mode === 'incremental' && report.changedFiles?.length > 0 && (
+          <div className="rounded-lg border border-border bg-surface p-4 mb-6">
+            <p className="font-mono text-xs uppercase tracking-widest text-textMuted mb-2">
+              Changed since last review
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {report.changedFiles.map((file) => (
+                <span key={file} className="font-mono text-xs px-2 py-1 rounded border border-border text-text">
+                  {file}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Validation warnings */}
         {report.validationWarnings?.length > 0 && (
@@ -69,9 +101,11 @@ export default function ReportView({ report, onNewReview }) {
         )}
 
         {/* Linter runs */}
-        <div className="mb-6">
-          <LinterRunPanel runs={report.linterRuns} />
-        </div>
+        {report.linterRuns?.length > 0 && (
+          <div className="mb-6">
+            <LinterRunPanel runs={report.linterRuns} />
+          </div>
+        )}
 
         {/* Issues */}
         <div className="mb-2 flex items-baseline justify-between">
