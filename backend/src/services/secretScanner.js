@@ -102,6 +102,15 @@ const MAX_FILES_TO_SCAN = 5000;
  * Exact basenames (case-insensitive) that should always be skipped.
  * These files often contain placeholder credentials used as documentation
  * examples, not real secrets.
+ *
+ * The test-*.js entries are secretScanner's own manual smoke-test scripts
+ * (see backend/src/test-clone-step.js) — they intentionally embed
+ * placeholder-looking secret strings as fixtures to verify this scanner's
+ * own detection/ignore logic. Without this entry, reviewing this repository
+ * against itself flags those fixtures as real findings and blocks the
+ * pipeline. Longer-term, these scripts belong outside src/ (e.g. a top-level
+ * scripts/ or test/ folder) so they're never part of what gets scanned or
+ * shipped in the first place — see the project Readme's "flaws" discussion.
  */
 const IGNORED_FILE_NAMES = new Set([
   'readme.md',
@@ -111,6 +120,9 @@ const IGNORED_FILE_NAMES = new Set([
   'env.example',
   'env.sample',
   'env.template',
+  'test-clone-step.js',
+  'test-linter-step.js',
+  'test-repo.js',
 ]);
 
 /**
